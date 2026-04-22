@@ -1,0 +1,9 @@
+# Install dependencies as needed:
+# pip install kagglehub[pandas-datasets]
+import kagglehub
+from kagglehub import KaggleDatasetAdapter
+
+# Download latest version
+path = kagglehub.dataset_download("vbookshelf/respiratory-sound-database")
+
+print("Path to dataset files:", path)
