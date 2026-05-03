@@ -15,10 +15,11 @@ import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 from collections import Counter
 import pandas as pd
+import soundfile as sf 
 
 # ____________________________________________________
 # Helper functions
-def slice_into_segments(audio, sample_rate, duration):
+def slice_into_segments(audio, sample_rate, duration): # slices the audio into segments of a specified duration, padding the last segment if it's shorter than the desired length
     segment_len = sample_rate * duration
     segments = []
     start = 0
@@ -30,14 +31,14 @@ def slice_into_segments(audio, sample_rate, duration):
         start += segment_len
     return segments
 
-def compute_features(chunk, sample_rate, n_mfcc):
+def compute_features(chunk, sample_rate, n_mfcc): # identifies the MFCC features of a given audio chunk, along with its first and second order deltas, and returns them as a tensor
     mfcc    = librosa.feature.mfcc(y=chunk, sr=sample_rate, n_mfcc=n_mfcc)
     delta   = librosa.feature.delta(mfcc)
     delta2  = librosa.feature.delta(mfcc, order=2)
     features = np.concatenate([mfcc, delta, delta2], axis=0)   # (n_mfcc*3, T)
     return torch.tensor(features, dtype=torch.float32).unsqueeze(0)
 
-def precompute_features(file_samples, sample_rate, duration, n_mfcc):
+def precompute_features(file_samples, sample_rate, duration, n_mfcc): # pre-computes features for all audio samples and caches them in RAM to speed up training, while also providing progress updates
     segment_len = sample_rate * duration
 
     total_segments = 0
@@ -80,7 +81,7 @@ def precompute_features(file_samples, sample_rate, duration, n_mfcc):
     print(f"    Done — {seg_count} segments cached in RAM.\n")
     return cache, seg_count
 
-def augment_features(tensor):
+def augment_features(tensor): # applies time and frequency masking to the input tensor for data augmentation, randomly blanking out sections of the time and frequency axes to improve model robustness against variations in the input data
     """
     tensor shape: (1, n_features, time_frames)
     Returns an augmented copy — does NOT modify the cached original.
@@ -102,9 +103,10 @@ def augment_features(tensor):
 
     return t
 
-def preview_random_sample(dataset, categories, sample_rate, duration):
-    idx = random.randint(0, len(dataset) - 1)
-    fpath, label = dataset.samples[idx]
+def preview_random_sample(dataset, categories, sample_rate, duration): # previews a random audio sample from the dataset with its label and category, plays the audio for the user running the script.
+    # FIX: use file_samples (fpath, label) instead of samples (tensor, label)
+    idx = random.randint(0, len(dataset.file_samples) - 1)
+    fpath, label = dataset.file_samples[idx]
 
     print("=" * 45)
     print("🎧 Random Audio Sample Preview")
@@ -130,10 +132,10 @@ def preview_random_sample(dataset, categories, sample_rate, duration):
     input("  Press ENTER to continue to training...")
     print()
 
-def plot_dataset_distribution(train_dataset, test_dataset, categories):
-    # Get counts for each class in train and test sets
-    train_counts = Counter([s[1] for s in train_dataset.samples])
-    test_counts = Counter([s[1] for s in test_dataset.samples])
+def plot_dataset_distribution(train_dataset, test_dataset, categories): # plots the distribution of samples across categories for both train and test sets
+    # FIX: use file_samples (fpath, label) instead of samples (tensor, label)
+    train_counts = Counter([s[1] for s in train_dataset.file_samples])
+    test_counts = Counter([s[1] for s in test_dataset.file_samples])
     
     # Create a DataFrame for easy plotting
     data = {
@@ -162,8 +164,7 @@ def plot_dataset_distribution(train_dataset, test_dataset, categories):
 # ____________________________________________________
 # Dataset and Model Definition
 
-# Focal Loss Implementation to handle class imbalance
-class FocalLoss(nn.Module):
+class FocalLoss(nn.Module): # Focal Loss Implementation to handle class imbalance
     def __init__(self, alpha=1, gamma=2):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
@@ -210,7 +211,8 @@ class AudioDataset(Dataset):
         self.sample_rate = sample_rate
         self.duration = duration
         self.n_mfcc = n_mfcc
-        self.samples = []  # This will now store (mfcc_tensor, label)
+        self.samples = []      # (mfcc_tensor, label) — used by DataLoader
+        self.file_samples = [] # FIX: (fpath, label) — used by preview and distribution plot
 
         segment_len = int(sample_rate * duration)
 
@@ -222,6 +224,9 @@ class AudioDataset(Dataset):
                 for fname in os.listdir(label_dir):
                     if fname.endswith('.wav'):
                         fpath = os.path.join(label_dir, fname)
+
+                        # FIX: track file path for preview/distribution functions
+                        self.file_samples.append((fpath, label_idx))
                         
                         # Load full audio
                         audio, _ = librosa.load(fpath, sr=sample_rate)
@@ -260,71 +265,56 @@ class Attention(nn.Module):
         weights = torch.softmax(self.attention(x), dim=1)
         return torch.sum(weights * x, dim=1)
 
-# class ResBlock(nn.Module):
-#     def __init__(self, in_channels, out_channels):
-#         super().__init__()
-#         self.conv = nn.Sequential(
-#             nn.Conv2d(in_channels, out_channels, 3, padding=1),
-#             nn.BatchNorm2d(out_channels), nn.ReLU(),
-#             nn.Conv2d(out_channels, out_channels, 3, padding=1),
-#             nn.BatchNorm2d(out_channels)
-#         )
-#         self.shortcut = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
-#         self.relu = nn.ReLU()
-
-#     def forward(self, x):
-#         return self.relu(self.conv(x) + self.shortcut(x))
-
-# class NeuralNet(nn.Module): # CNN + BiGRU + Attention
-#     def __init__(self, num_classes):
-#         super(NeuralNet, self).__init__()
-#         self.features = nn.Sequential(
-#             # Block 1
-#             nn.Conv2d(1, 32, kernel_size=3, padding=1), 
-#             nn.BatchNorm2d(32), nn.ReLU(), 
-#             nn.MaxPool2d(2), nn.Dropout2d(0.2),
-            
-#             # Block 2
-#             nn.Conv2d(32, 64, kernel_size=3, padding=1), 
-#             nn.BatchNorm2d(64), nn.ReLU(), 
-#             nn.MaxPool2d(2), nn.Dropout2d(0.2),
-            
-#             # Block 3
-#             nn.Conv2d(64, 128, kernel_size=3, padding=1), 
-#             nn.BatchNorm2d(128), nn.ReLU(), 
-#             nn.AdaptiveAvgPool2d((1, None)), nn.Dropout2d(0.2)
-#         )
-#         self.rnn = nn.GRU(128, 64, batch_first=True, bidirectional=True)
-#         self.attention = Attention(64)
-#         self.classifier = nn.Sequential(
-#             nn.Linear(128, 64), nn.ReLU(), 
-#             nn.Dropout(0.4), 
-#             nn.Linear(64, num_classes)
-#         )
-
-#     def forward(self, x):
-#         x = self.features(x).squeeze(2).permute(0, 2, 1)
-#         x, _ = self.rnn(x)
-#         x = self.attention(x)
-#         # Concatenate final hidden states from both directions of GRU
-#         # torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
-#         return self.classifier(x)
-
-class NeuralNet(nn.Module): # CNN + BiGRU
+class NeuralNet(nn.Module): # CNN + BiGRU + Attention
     def __init__(self, num_classes):
         super(NeuralNet, self).__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(1, 32, 5, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 5, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 5, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, None))
+            # Block 1
+            nn.Conv2d(1, 32, kernel_size=3, padding=1), 
+            nn.BatchNorm2d(32), nn.ReLU(), 
+            nn.MaxPool2d(2), nn.Dropout2d(0.2),
+            
+            # Block 2
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), 
+            nn.BatchNorm2d(64), nn.ReLU(), 
+            nn.MaxPool2d(2), nn.Dropout2d(0.2),
+            
+            # Block 3
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), 
+            nn.BatchNorm2d(128), nn.ReLU(), 
+            nn.AdaptiveAvgPool2d((1, None)), nn.Dropout2d(0.2)
         )
         self.rnn = nn.GRU(128, 64, batch_first=True, bidirectional=True)
-        self.classifier = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, num_classes))
+        self.attention = Attention(64)
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 64), nn.ReLU(), 
+            nn.Dropout(0.4), 
+            nn.Linear(64, num_classes)
+        )
 
     def forward(self, x):
         x = self.features(x).squeeze(2).permute(0, 2, 1)
-        _, h_n = self.rnn(x)
-        return self.classifier(torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1))
+        x, _ = self.rnn(x)
+        x = self.attention(x)
+        # Concatenate final hidden states from both directions of GRU
+        # torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
+        return self.classifier(x)
+
+# class NeuralNet(nn.Module): # CNN + BiGRU
+#     def __init__(self, num_classes):
+#         super(NeuralNet, self).__init__()
+#         self.features = nn.Sequential(
+#             nn.Conv2d(1, 32, 5, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+#             nn.Conv2d(32, 64, 5, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+#             nn.Conv2d(64, 128, 5, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, None))
+#         )
+#         self.rnn = nn.GRU(128, 64, batch_first=True, bidirectional=True)
+#         self.classifier = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, num_classes))
+
+#     def forward(self, x):
+#         x = self.features(x).squeeze(2).permute(0, 2, 1)
+#         _, h_n = self.rnn(x)
+#         return self.classifier(torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1))
     
 # class NeuralNet(nn.Module): # CNN + Transformer
 #     def __init__(self, num_classes):
@@ -353,7 +343,7 @@ class NeuralNet(nn.Module): # CNN + BiGRU
 # ____________________________________________________
 # Training and Testing Loops
 
-def train_loop(dataloader, model, loss_fn, optimizer):
+def train_loop(dataloader, model, loss_fn, optimizer): # train loop definition 
     model.train()
     total_loss = 0
     for X, y in dataloader:
@@ -366,7 +356,7 @@ def train_loop(dataloader, model, loss_fn, optimizer):
     avg_loss = total_loss / len(dataloader)
     return avg_loss
 
-def test_loop(dataloader, model, loss_fn, categories):
+def test_loop(dataloader, model, loss_fn, categories): # test loop definintion
     model.eval()
     all_preds, all_labels = [], []
     test_loss = 0
@@ -385,7 +375,7 @@ def test_loop(dataloader, model, loss_fn, categories):
                                 target_names=categories, zero_division=0))
     return all_labels, all_preds, avg_test_loss, accuracy
 
-def get_weighted_sampler(dataset):
+def get_weighted_sampler(dataset): # attempts to weight the samples to counteract class imbalance
     targets = [s[1] for s in dataset.samples]
     class_counts = Counter(targets)
     num_samples = len(targets)
@@ -402,7 +392,7 @@ def main():
 
     num_epochs = 10
     
-    SAMPLE_RATE, DURATION, N_MFCC = 22050, 5, 40
+    SAMPLE_RATE, DURATION, N_MFCC = 22050, 2, 40
     CATEGORIES = ['asthma', 'Bronchial', 'copd', 'healthy', 'pneumonia']
     label2idx = {label: idx for idx, label in enumerate(CATEGORIES)}
     
@@ -410,7 +400,7 @@ def main():
     test_data = AudioDataset(test_dir, SAMPLE_RATE, DURATION, N_MFCC, label2idx)
     
     # Preview sample before starting
-    # preview_random_sample(train_data, CATEGORIES, SAMPLE_RATE, DURATION)
+    preview_random_sample(train_data, CATEGORIES, SAMPLE_RATE, DURATION)
     plot_dataset_distribution(train_data, test_data, CATEGORIES)
 
     sampler = get_weighted_sampler(train_data)
