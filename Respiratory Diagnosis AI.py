@@ -18,7 +18,89 @@ import pandas as pd
 
 # ____________________________________________________
 # Helper functions
+def slice_into_segments(audio, sample_rate, duration):
+    segment_len = sample_rate * duration
+    segments = []
+    start = 0
+    while start < len(audio):
+        chunk = audio[start : start + segment_len]
+        if len(chunk) < segment_len:
+            chunk = np.pad(chunk, (0, segment_len - len(chunk)))
+        segments.append(chunk)
+        start += segment_len
+    return segments
 
+def compute_features(chunk, sample_rate, n_mfcc):
+    mfcc    = librosa.feature.mfcc(y=chunk, sr=sample_rate, n_mfcc=n_mfcc)
+    delta   = librosa.feature.delta(mfcc)
+    delta2  = librosa.feature.delta(mfcc, order=2)
+    features = np.concatenate([mfcc, delta, delta2], axis=0)   # (n_mfcc*3, T)
+    return torch.tensor(features, dtype=torch.float32).unsqueeze(0)
+
+def precompute_features(file_samples, sample_rate, duration, n_mfcc):
+    segment_len = sample_rate * duration
+
+    total_segments = 0
+    for fpath, _ in file_samples:
+        info = sf.info(fpath)
+        total_segments += max(1, int(np.ceil(info.duration / duration)))
+
+    print(f"    Total segments to pre-compute : {total_segments}")
+    print(f"    Across {len(file_samples)} audio files\n")
+
+    cache     = []
+    seg_count = 0
+
+    for fpath, label in file_samples:
+        audio, _ = librosa.load(fpath, sr=sample_rate)
+
+        if len(audio) == 0:
+            silence = np.zeros(segment_len, dtype=np.float32)
+            tensor  = compute_features(silence, sample_rate, n_mfcc)
+            cache.append((tensor, label))
+            seg_count += 1
+            continue
+
+        start = 0
+        while start < len(audio):
+            chunk = audio[start : start + segment_len]
+            if len(chunk) < segment_len:
+                chunk = np.pad(chunk, (0, segment_len - len(chunk)))
+
+            tensor = compute_features(chunk, sample_rate, n_mfcc)
+            cache.append((tensor, label))
+
+            start     += segment_len
+            seg_count += 1
+
+            if seg_count % 100 == 0:
+                pct = 100 * seg_count / total_segments
+                print(f"    [{seg_count:>5d} / {total_segments}]  {pct:.1f}% complete")
+
+    print(f"    Done — {seg_count} segments cached in RAM.\n")
+    return cache, seg_count
+
+def augment_features(tensor):
+    """
+    tensor shape: (1, n_features, time_frames)
+    Returns an augmented copy — does NOT modify the cached original.
+    """
+    t = tensor.clone()
+    _, n_freq, n_time = t.shape
+
+    # Time masking — blank out up to 1/8 of the time axis
+    if n_time > 8:
+        t_mask  = random.randint(1, max(1, n_time // 8))
+        t_start = random.randint(0, n_time - t_mask)
+        t[:, :, t_start : t_start + t_mask] = 0.0
+
+    # Frequency masking — blank out up to 1/8 of the frequency axis
+    if n_freq > 8:
+        f_mask  = random.randint(1, max(1, n_freq // 8))
+        f_start = random.randint(0, n_freq - f_mask)
+        t[:, f_start : f_start + f_mask, :] = 0.0
+
+    return t
 
 def preview_random_sample(dataset, categories, sample_rate, duration):
     idx = random.randint(0, len(dataset) - 1)
@@ -93,35 +175,81 @@ class FocalLoss(nn.Module):
         focal_loss = self.alpha * (1 - pt)**self.gamma * ce_loss
         return focal_loss.mean()
 
+# class AudioDataset(Dataset):
+#     def __init__(self, audio_dir, sample_rate, duration, n_mfcc, label2idx):
+#         self.sample_rate = sample_rate
+#         self.duration = duration
+#         self.n_mfcc = n_mfcc
+#         self.samples = []
+
+#         # Iterate through directories to find .wav files
+#         for label_name in os.listdir(audio_dir):
+#             label_dir = os.path.join(audio_dir, label_name)
+#             if os.path.isdir(label_dir) and label_name in label2idx:
+#                 for fname in os.listdir(label_dir):
+#                     if fname.endswith('.wav'):
+#                         fpath = os.path.join(label_dir, fname)
+#                         self.samples.append((fpath, label2idx[label_name]))
+
+#     def __len__(self): 
+#         return len(self.samples)
+
+#     def __getitem__(self, idx):
+#         fpath, label = self.samples[idx]
+#         # Load audio, ensuring it matches the duration defined in main
+#         audio, _ = librosa.load(fpath, sr=self.sample_rate, duration=self.duration)
+        
+#         target_len = self.sample_rate * self.duration
+#         audio = np.pad(audio, (0, max(0, target_len - len(audio))))[:target_len]
+        
+#         mfcc = librosa.feature.mfcc(y=audio, sr=self.sample_rate, n_mfcc=self.n_mfcc)
+#         return torch.tensor(mfcc, dtype=torch.float32).unsqueeze(0), label
+
 class AudioDataset(Dataset):
     def __init__(self, audio_dir, sample_rate, duration, n_mfcc, label2idx):
         self.sample_rate = sample_rate
         self.duration = duration
         self.n_mfcc = n_mfcc
-        self.samples = []
+        self.samples = []  # This will now store (mfcc_tensor, label)
 
-        # Iterate through directories to find .wav files
+        segment_len = int(sample_rate * duration)
+
+        print(f"Processing audio files from {audio_dir}...")
         for label_name in os.listdir(audio_dir):
             label_dir = os.path.join(audio_dir, label_name)
             if os.path.isdir(label_dir) and label_name in label2idx:
+                label_idx = label2idx[label_name]
                 for fname in os.listdir(label_dir):
                     if fname.endswith('.wav'):
                         fpath = os.path.join(label_dir, fname)
-                        self.samples.append((fpath, label2idx[label_name]))
+                        
+                        # Load full audio
+                        audio, _ = librosa.load(fpath, sr=sample_rate)
+                        
+                        # Slice into segments
+                        start = 0
+                        while start + segment_len <= len(audio):
+                            segment = audio[start : start + segment_len]
+                            mfcc = librosa.feature.mfcc(y=segment, sr=sample_rate, n_mfcc=n_mfcc)
+                            self.samples.append((torch.tensor(mfcc, dtype=torch.float32).unsqueeze(0), label_idx))
+                            start += segment_len
+                        
+                        # Optional: Include the final fragment if it's shorter than duration
+                        # by padding it (ensures no data is lost)
+                        if start < len(audio):
+                            remaining = audio[start:]
+                            padding = segment_len - len(remaining)
+                            segment = np.pad(remaining, (0, padding))
+                            mfcc = librosa.feature.mfcc(y=segment, sr=sample_rate, n_mfcc=n_mfcc)
+                            self.samples.append((torch.tensor(mfcc, dtype=torch.float32).unsqueeze(0), label_idx))
+
+        # print(f"Dataset ready with {len(self.samples)} segments.")
 
     def __len__(self): 
         return len(self.samples)
 
     def __getitem__(self, idx):
-        fpath, label = self.samples[idx]
-        # Load audio, ensuring it matches the duration defined in main
-        audio, _ = librosa.load(fpath, sr=self.sample_rate, duration=self.duration)
-        
-        target_len = self.sample_rate * self.duration
-        audio = np.pad(audio, (0, max(0, target_len - len(audio))))[:target_len]
-        
-        mfcc = librosa.feature.mfcc(y=audio, sr=self.sample_rate, n_mfcc=self.n_mfcc)
-        return torch.tensor(mfcc, dtype=torch.float32).unsqueeze(0), label
+        return self.samples[idx]
 
 class Attention(nn.Module):
     def __init__(self, hidden_dim):
@@ -147,58 +275,58 @@ class Attention(nn.Module):
 #     def forward(self, x):
 #         return self.relu(self.conv(x) + self.shortcut(x))
 
-class NeuralNet(nn.Module):
-    def __init__(self, num_classes):
-        super(NeuralNet, self).__init__()
-        self.features = nn.Sequential(
-            # Block 1
-            nn.Conv2d(1, 32, kernel_size=3, padding=1), 
-            nn.BatchNorm2d(32), nn.ReLU(), 
-            nn.MaxPool2d(2), nn.Dropout2d(0.2),
-            
-            # Block 2
-            nn.Conv2d(32, 64, kernel_size=3, padding=1), 
-            nn.BatchNorm2d(64), nn.ReLU(), 
-            nn.MaxPool2d(2), nn.Dropout2d(0.2),
-            
-            # Block 3
-            nn.Conv2d(64, 128, kernel_size=3, padding=1), 
-            nn.BatchNorm2d(128), nn.ReLU(), 
-            nn.AdaptiveAvgPool2d((1, None)), nn.Dropout2d(0.2)
-        )
-        self.rnn = nn.GRU(128, 64, batch_first=True, bidirectional=True)
-        self.attention = Attention(64)
-        self.classifier = nn.Sequential(
-            nn.Linear(128, 64), nn.ReLU(), 
-            nn.Dropout(0.4), 
-            nn.Linear(64, num_classes)
-        )
-
-    def forward(self, x):
-        x = self.features(x).squeeze(2).permute(0, 2, 1)
-        x, _ = self.rnn(x)
-        x = self.attention(x)
-        # Concatenate final hidden states from both directions of GRU
-        # torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
-        return self.classifier(x)
-
-# class NeuralNet(nn.Module):
+# class NeuralNet(nn.Module): # CNN + BiGRU + Attention
 #     def __init__(self, num_classes):
 #         super(NeuralNet, self).__init__()
 #         self.features = nn.Sequential(
-#             nn.Conv2d(1, 32, 5, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
-#             nn.Conv2d(32, 64, 5, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
-#             nn.Conv2d(64, 128, 5, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, None))
+#             # Block 1
+#             nn.Conv2d(1, 32, kernel_size=3, padding=1), 
+#             nn.BatchNorm2d(32), nn.ReLU(), 
+#             nn.MaxPool2d(2), nn.Dropout2d(0.2),
+            
+#             # Block 2
+#             nn.Conv2d(32, 64, kernel_size=3, padding=1), 
+#             nn.BatchNorm2d(64), nn.ReLU(), 
+#             nn.MaxPool2d(2), nn.Dropout2d(0.2),
+            
+#             # Block 3
+#             nn.Conv2d(64, 128, kernel_size=3, padding=1), 
+#             nn.BatchNorm2d(128), nn.ReLU(), 
+#             nn.AdaptiveAvgPool2d((1, None)), nn.Dropout2d(0.2)
 #         )
 #         self.rnn = nn.GRU(128, 64, batch_first=True, bidirectional=True)
-#         self.classifier = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, num_classes))
+#         self.attention = Attention(64)
+#         self.classifier = nn.Sequential(
+#             nn.Linear(128, 64), nn.ReLU(), 
+#             nn.Dropout(0.4), 
+#             nn.Linear(64, num_classes)
+#         )
 
 #     def forward(self, x):
 #         x = self.features(x).squeeze(2).permute(0, 2, 1)
-#         _, h_n = self.rnn(x)
-#         return self.classifier(torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1))
+#         x, _ = self.rnn(x)
+#         x = self.attention(x)
+#         # Concatenate final hidden states from both directions of GRU
+#         # torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
+#         return self.classifier(x)
+
+class NeuralNet(nn.Module): # CNN + BiGRU
+    def __init__(self, num_classes):
+        super(NeuralNet, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, 5, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 5, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 5, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.AdaptiveAvgPool2d((1, None))
+        )
+        self.rnn = nn.GRU(128, 64, batch_first=True, bidirectional=True)
+        self.classifier = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, num_classes))
+
+    def forward(self, x):
+        x = self.features(x).squeeze(2).permute(0, 2, 1)
+        _, h_n = self.rnn(x)
+        return self.classifier(torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1))
     
-# class NeuralNet(nn.Module):
+# class NeuralNet(nn.Module): # CNN + Transformer
 #     def __init__(self, num_classes):
 #         super(NeuralNet, self).__init__()
 #         self.features = nn.Sequential(
@@ -272,7 +400,7 @@ def main():
     train_dir = r'C:\Users\emanu\OneDrive - purdue.edu\Documents\PyTorch Scripts.Me\BME450 Project\AudioDataset\Asthma Detection Dataset Version 2\Train'
     test_dir = r'C:\Users\emanu\OneDrive - purdue.edu\Documents\PyTorch Scripts.Me\BME450 Project\AudioDataset\Asthma Detection Dataset Version 2\Test'
 
-    num_epochs = 20
+    num_epochs = 10
     
     SAMPLE_RATE, DURATION, N_MFCC = 22050, 5, 40
     CATEGORIES = ['asthma', 'Bronchial', 'copd', 'healthy', 'pneumonia']
